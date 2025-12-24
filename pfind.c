@@ -27,15 +27,7 @@ worker thread
 
 
 */
-//settings (shared struct)
-struct Settings{
 
-	char *pathName; //
-	char *pattern;
-	char type;
-	int nthreads;
-
-};
 
 //long options struct
 struct option longopts[] = {
@@ -43,6 +35,32 @@ struct option longopts[] = {
 	{"type", required_argument, NULL, 'T'},
 	{"size", required_argument, NULL, 's'},
 	{"help", no_argument, NULL, 'h'}
+};
+
+
+//settings (shared struct)
+struct Settings{
+
+	char *rootPath; //
+	char *pattern;
+	char type;
+	int nthreads;
+	int done;
+	int active_workers;
+	pthread_mutex_t queue_mtx;
+};
+
+//one directory = one task
+struct Task{
+	char *path;
+	struct Task *next;
+};
+
+//task queue
+struct TaskQueue{
+	struct Task *head;
+	struct Task *tail;
+	int size;
 };
 
 //worker thread
@@ -58,14 +76,19 @@ int main(int argc, char **argv){
 	int nthreads;
 	int opt; opterr = 0;
 	struct stat st;
+
 	struct Settings *set = malloc(sizeof(struct Settings));
+	set->active_workers = 0;
+	set->done = 0;
+
 	char *path = argv[optind];
 	char *pattern = argv[optind+1];
+
 
 	//validate that the root directory exists
  	if(stat(path, &st) == 0){
 		if(S_ISDIR(st.st_mode)){
-			set->pathName = path;
+			set->rootPath = path;
 			set->pattern = pattern;
 		}else{
 			printf("The Directory given does not exist");
