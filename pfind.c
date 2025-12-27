@@ -9,8 +9,8 @@
 #include <dirent.h>
 
 #define DEFAULT_NTHREADS 2
+
 void usage(const char *prog);
-//One directory traversal = one task in the work queue
 
 //pfind <root_dir> <pattern> [-t N]
 
@@ -49,18 +49,34 @@ struct TaskQueue{
 	int size;
 };
 
-//enqueue function (push at tail)
-void enqueue(struct Task *task){
 
-	if(head == NULL){
-		head = task;
+//worker arguments
+struct Worker_Args{
+
+	struct Task *task;
+	struct Settings *set;
+	struct TaskQueue *tq;
+
+};
+
+//enqueue function (push at tail)
+void enqueue(struct Task *task, struct Worker_Args *wargs){
+	task->next = NULL;
+
+	pthread_mutex_lock(&wargs-set->queue_mtx);
+
+	if(wargs->tq->head == NULL){
+		//empty queue
+		wargs->tq->head = task;
+		wargs->tq->tail = task;
 	}else{
-		temp = head;
-		while(temp->next != NULL){
-			temp=temp->next;
-		}
-		temp->next = task;
+		//non empty queue
+		wargs->tq->tail->next = task;
+		wargs->tq->tail = task;
 	}
+	wargs->tq->size++;
+	pthread_cond_signal(&wargs->set->queue_cond);
+	pthread_mutex_unlock(&wargs->set->queue_mtx);
 
 }
 
@@ -72,25 +88,27 @@ void dequeue(struct Task *task){
 
 //worker thread
 void *worker(void *arg){
-	struct Task *newDir = (struct Task *)arg;
+	struct Worker_Args *wargs = (struct Worker_Args *)arg;
 	struct stat st;
 	char fullpath[PATH_MAX];
 	//
 	DIR *dir;
 	struct dirent *entry;
-	dir = opendir(newDir->path);
-	while((entry = readdir(dir)) != NULL){
+	dir = opendir(wargs->task->path);
+	while((entry = readdir(dir)) != NULL){ //parse through the files in the directory
 		if(strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 		//if the entry is a directory
 
-		snprintf(fullpath, sizeof(fullpath), "%s/%s",newDir->path, entry->d_name);
+		snprintf(fullpath, sizeof(fullpath), "%s/%s", wargs->task->path, entry->d_name);
 
-		if (lstat(fullpath, &sb) == 0 && S_ISDIR(sb.st_mode)){
+		if (lstat(fullpath, &st) == 0 && S_ISDIR(st.st_mode)){
         		//create a new task and add it to the queue
 			struct Task *newTask = malloc(sizeof(struct Task));
-			enqueue(newTask);
+			newTask->path = strdup(fullpath);
+			newTask->next = NULL;
+			enqueue(newTask, wargs);
 		}
-		
+
 	}
 
 	return NULL;
@@ -104,25 +122,31 @@ int main(int argc, char **argv){
 	struct stat st;
 
 	//create Settings struct and initialize stuff
-	struct Settings *set = malloc(sizeof(struct Settings));
+	struct Settings *set = malloc(sizeof(struct Settings)); //rootpath, pattern, type, nthreads, done, working_count 
 	set->working_count = 0;
 	set->done = 0;
 	set->nthreads = nthreads;
 
 	//create the TaskQueue struct
 	struct TaskQueue *tq = malloc(sizeof(struct TaskQueue));
+	tq->size = 0;
+	tq->head = NULL;
+	tq->tail = NULL;
+
 	//create the head task
-	struct Task *root = malloc(sizeof(struct Task));
+	struct Task *rootTask = malloc(sizeof(struct Task));
 
 
-	char *path = argv[optind];
-	char *pattern = argv[optind+1];
+	//create worker args struct 
+	struct Worker_Args *wargs = malloc(sizeof(struct Worker_Args));
+	wargs->set = set;
+	wargs->tq = tq;
 
 
 	//validate that the root directory exists
  	if(stat(path, &st) == 0){
 		if(S_ISDIR(st.st_mode)){
-			root->path = path;
+			rootTask->path = path;
 			set->rootPath = path;
 			set->pattern = pattern;
 		}else{
@@ -176,20 +200,40 @@ int main(int argc, char **argv){
 
 		}
 	}
-	//initialize the mutex
-	pthread_mutex_init(&(set->queue_mtx), NULL);
 
-	// Enqueue the root directory 
-	root->path = set->rootPath;
-	
+	if(optind + 2 > argc) usage(argv[0]);
+
+	char *path = argv[optind];
+	char *pattern = argv[optind+1];
+
+	//initialize the mutex and condition var
+	pthread_mutex_init(&set->queue_mtx, NULL);
+	pthread_cond_init(&set->queue_cond, NULL);
+
+	// Enqueue the root directory
+	rootTask->path = set->rootPath;
+
 	//create n threads
 	pthread_t *thread_arr = malloc(nthreads*sizeof(pthread_t));
 	for(int i=0; i<nthreads; i++){
-		pthread_create(&thread_arr[i], NULL, worker, root);
+		pthread_create(&thread_arr[i], NULL, worker, wargs);
 
 	}
 	return 0;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
