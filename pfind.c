@@ -18,7 +18,6 @@ void usage(const char *prog);
 struct option longopts[] = {
 
 	{"type", required_argument, NULL, 'T'},
-	{"size", required_argument, NULL, 's'},
 	{"help", no_argument, NULL, 'h'}
 };
 
@@ -34,6 +33,7 @@ struct Settings{
 	int working_count; //
 	pthread_mutex_t queue_mtx;
 	pthread_cond_t queue_cond;
+	pthread_mutex_t print_mtx;
 };
 
 //one directory = one task, the nodes in the linked list/queue
@@ -111,32 +111,115 @@ struct Task *dequeue(struct Worker_Args *wargs){
 }
 
 //worker thread
-void *worker(void *arg){
-	struct Worker_Args *wargs = (struct Worker_Args *)arg;
-	struct stat st;
-	char fullpath[PATH_MAX];
-	struct Task *task = dequeue(wargs);
-	//
-	DIR *dir;
-	struct dirent *entry;
-	dir = opendir(task->path);
-	while((entry = readdir(dir)) != NULL){ //parse through the files in the directory
-		if(strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-		//if the entry is a directory
+void *worker(void *arg)
+{
+    struct Worker_Args *wargs = (struct Worker_Args *)arg;
+    struct Settings *set = wargs->set;
+    struct TaskQueue *tq = wargs->tq;
 
-		snprintf(fullpath, sizeof(fullpath), "%s/%s", task->path, entry->d_name);
+    for (;;) {
+        struct Task *task = dequeue(wargs);
+        if (task == NULL) {
+            // done was set and queue is empty
+            return NULL;
+        }
 
-		if (lstat(fullpath, &st) == 0 && S_ISDIR(st.st_mode)){
-        		//create a new task and add it to the queue
-			struct Task *newTask = malloc(sizeof(struct Task));
-			newTask->path = strdup(fullpath);
-			newTask->next = NULL;
-			enqueue(newTask, wargs);
-		}
+        DIR *dir = opendir(task->path);
+        if (dir == NULL) {
+            // Can't open directory (permissions, deleted, etc.)
+            // Still must mark this task as finished.
+            pthread_mutex_lock(&set->queue_mtx);
+            set->working_count--;
+            if (tq->size == 0 && set->working_count == 0) {
+                set->done = 1;
+                pthread_cond_broadcast(&set->queue_cond);
+            }
+            pthread_mutex_unlock(&set->queue_mtx);
 
-	}
+            free(task->path);
+            free(task);
+            continue;
+        }
 
-	return NULL;
+        struct dirent *entry;
+        struct stat st;
+        char fullpath[PATH_MAX];
+
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0)
+                continue;
+
+            // Build full path
+            snprintf(fullpath, sizeof(fullpath), "%s/%s",
+                     task->path, entry->d_name);
+
+            if (lstat(fullpath, &st) != 0) {
+                // Can't stat it; skip
+                continue;
+            }
+
+            int is_dir  = S_ISDIR(st.st_mode);
+            int is_file = S_ISREG(st.st_mode);
+
+            // --- (Optional) print matches ---
+            // pattern match (simple substring)
+            if (set->pattern != NULL && strstr(fullpath, set->pattern) != NULL) {
+                if (set->type == 'd') {
+                    if (is_dir) {
+			pthread_mutex_lock(&set->print_mtx);
+                        printf("%s\n", fullpath);
+			pthread_mutex_unlock(&set->print_mtx);
+                    }
+                } else if (set->type == 'f') {
+                    if (is_file) {
+			pthread_mutex_lock(&set->print_mtx);
+                        printf("%s\n", fullpath);
+			pthread_mutex_unlock(&set->print_mtx);
+                    }
+                } else {
+                    // no type filter
+		 	pthread_mutex_lock(&set->print_mtx);
+		 	printf("%s\n", fullpath);
+			pthread_mutex_unlock(&set->print_mtx);
+                }
+            }
+
+            // BFS expansion: enqueue subdirectories
+            if (is_dir) {
+                struct Task *newTask = malloc(sizeof(struct Task));
+                if (!newTask) {
+                    // out of memory; skip safely
+                    continue;
+                }
+                newTask->path = strdup(fullpath);
+                if (!newTask->path) {
+                    free(newTask);
+                    continue;
+                }
+                newTask->next = NULL;
+                enqueue(newTask, wargs);
+            }
+        }
+
+        closedir(dir);
+
+        // Finished processing this task
+        pthread_mutex_lock(&set->queue_mtx);
+        set->working_count--;
+
+        // Termination detection:
+        // if nobody is working and no queued tasks remain, we are done.
+        if (tq->size == 0 && set->working_count == 0) {
+            set->done = 1;
+            pthread_cond_broadcast(&set->queue_cond);
+        }
+
+        pthread_mutex_unlock(&set->queue_mtx);
+
+        free(task->path);
+        free(task);
+    }
 }
 
 //// MAIN ///////
@@ -148,22 +231,25 @@ int main(int argc, char **argv){
 
 	//create Settings struct and initialize stuff
 	struct Settings *set = malloc(sizeof(struct Settings)); //rootpath, pattern, type, nthreads, done, working_count 
+	if(!set){ perror("malloc"); exit(EXIT_FAILURE); }
 	set->working_count = 0;
 	set->done = 0;
 	set->nthreads = nthreads;
+	set->type = 0;
+	set->rootPath = NULL;
+	set->pattern = NULL;
 
 	//create the TaskQueue struct
 	struct TaskQueue *tq = malloc(sizeof(struct TaskQueue));
+	if(!tq){ perror("malloc"); exit(EXIT_FAILURE); }
 	tq->size = 0;
 	tq->head = NULL;
 	tq->tail = NULL;
 
-	//create the head task
-	struct Task *rootTask = malloc(sizeof(struct Task));
-
 
 	//create worker args struct 
 	struct Worker_Args *wargs = malloc(sizeof(struct Worker_Args));
+	if(!wargs){ perror("malloc"); exit(EXIT_FAILURE); }
 	wargs->set = set;
 	wargs->tq = tq;
 
@@ -172,13 +258,12 @@ int main(int argc, char **argv){
 
 		switch(opt){
 			case 't': //thread count
-				if(sizeof(atoi(optarg)) == 4){
-					nthreads = atoi(optarg);
-					set->nthreads = nthreads;
-				}else{
-					printf("Option argument %s for option %c is not a valid integer", optarg, opt);
+				nthreads = atoi(optarg);
+				if(nthreads <= 0){
+					fprintf(stderr, "Invalid thread count: %s", optarg);
 					exit(EXIT_FAILURE);
 				}
+				set->nthreads = nthreads;
 				break;
 
 			case 'T': //type (file or directory)
@@ -192,6 +277,9 @@ int main(int argc, char **argv){
 						//for searching for a directory
 						set->type = 'd';
 					break;
+					default:
+						fprintf(stderr, "Invalid -T value (use f or d): %s\n", optarg);
+						exit(EXIT_FAILURE);
 				}
 				break;
 			case 'h': //help info
@@ -213,52 +301,65 @@ int main(int argc, char **argv){
 		}
 	}
 
-	if(optind + 2 > argc) usage(argv[0]);
+	if(optind + 2 > argc){
+		usage(argv[0]);
+		exit(EXIT_FAILURE);
+	}
 
 	char *path = argv[optind];
 	char *pattern = argv[optind+1];
 
 	//validate that the root directory exists
- 	if(stat(path, &st) == 0){
-		if(S_ISDIR(st.st_mode)){
-			rootTask->path = path;
-			set->rootPath = path;
-			set->pattern = pattern;
-		}else{
-			printf("The Directory given does not exist");
-			exit(EXIT_FAILURE);
-		}
+ 	if(stat(path, &st) != 0){
+		perror("stat");
+		exit(EXIT_FAILURE);
 	}
-
+	if(!S_ISDIR(st.st_mode)){
+		fprintf(stderr, "Not a directory: %s\n", path);
+		exit(EXIT_FAILURE);
+	}
+	
+	set->rootPath = path;
+	set->pattern = pattern;
 
 	//initialize the mutex and condition var
 	pthread_mutex_init(&set->queue_mtx, NULL);
 	pthread_cond_init(&set->queue_cond, NULL);
+	pthread_mutex_init(&set->print_mtx, NULL);
 
 	// Enqueue the root directory
-	rootTask->path = set->rootPath;
+	struct Task *rootTask = malloc(sizeof(struct Task));
+	if(!rootTask){ perror("malloc"); exit(EXIT_FAILURE); }
+	rootTask->path = strdup(set->rootPath);
+	if(!rootTask->path) {perror("strdup"); exit(EXIT_FAILURE); }
+	rootTask->next = NULL;
+	enqueue(rootTask, wargs);
 
 	//create n threads
 	pthread_t *thread_arr = malloc(nthreads*sizeof(pthread_t));
+	if(!thread_arr){ perror("malloc"); exit(EXIT_FAILURE); }
 	for(int i=0; i<nthreads; i++){
 		pthread_create(&thread_arr[i], NULL, worker, wargs);
-
 	}
+
+	//join threads
+	for(int i=0; i<nthreads; i++){
+		pthread_join(thread_arr[i], NULL);
+	}
+
+
+	//clean up
+	pthread_mutex_destroy(&set->queue_mtx);
+	pthread_cond_destroy(&set->queue_cond);
+	pthread_mutex_destroy(&set->print_mtx);
+	free(thread_arr);
+	free(wargs);
+	free(tq);
+	free(set);
+
+	
 	return 0;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -273,7 +374,7 @@ void usage(const char *prog) {
         "Search directories in parallel for matching files.\n"
         "\n"
         "Options:\n"
-        "  -t, --threads N        Number of worker threads (default: 4)\n"
+        "  -t, --threads N        Number of worker threads (default: 2)\n"
         "  -T, --type {f|d}       Match files (f) or directories (d)\n"
         "  -h, --help             Show this help message\n"
         "\n"
