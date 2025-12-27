@@ -53,7 +53,6 @@ struct TaskQueue{
 //worker arguments
 struct Worker_Args{
 
-	struct Task *task;
 	struct Settings *set;
 	struct TaskQueue *tq;
 
@@ -63,7 +62,7 @@ struct Worker_Args{
 void enqueue(struct Task *task, struct Worker_Args *wargs){
 	task->next = NULL;
 
-	pthread_mutex_lock(&wargs-set->queue_mtx);
+	pthread_mutex_lock(&wargs->set->queue_mtx);
 
 	if(wargs->tq->head == NULL){
 		//empty queue
@@ -81,9 +80,34 @@ void enqueue(struct Task *task, struct Worker_Args *wargs){
 }
 
 //dequeue function (pop at head)
-void dequeue(struct Task *task){
+struct Task *dequeue(struct Worker_Args *wargs){
+// pop the current head of the queue and return it
 
+	pthread_mutex_lock(&wargs->set->queue_mtx);
 
+	while(wargs->tq->head == NULL && !wargs->set->done){
+		pthread_cond_wait(&wargs->set->queue_cond, &wargs->set->queue_mtx);
+
+	}
+
+	if (wargs->tq->head == NULL && wargs->set->done) {
+        pthread_mutex_unlock(&wargs->set->queue_mtx);
+        return NULL;
+    	}
+
+	struct Task *task = wargs->tq->head;
+	wargs->tq->head = task->next;
+
+	if (wargs->tq->head == NULL)
+		wargs->tq->tail = NULL;
+
+	wargs->tq->size--;
+	wargs->set->working_count++;
+
+	pthread_mutex_unlock(&wargs->set->queue_mtx);
+
+	task->next = NULL;
+	return task;
 }
 
 //worker thread
@@ -91,15 +115,16 @@ void *worker(void *arg){
 	struct Worker_Args *wargs = (struct Worker_Args *)arg;
 	struct stat st;
 	char fullpath[PATH_MAX];
+	struct Task *task = dequeue(wargs);
 	//
 	DIR *dir;
 	struct dirent *entry;
-	dir = opendir(wargs->task->path);
+	dir = opendir(task->path);
 	while((entry = readdir(dir)) != NULL){ //parse through the files in the directory
 		if(strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
 		//if the entry is a directory
 
-		snprintf(fullpath, sizeof(fullpath), "%s/%s", wargs->task->path, entry->d_name);
+		snprintf(fullpath, sizeof(fullpath), "%s/%s", task->path, entry->d_name);
 
 		if (lstat(fullpath, &st) == 0 && S_ISDIR(st.st_mode)){
         		//create a new task and add it to the queue
@@ -114,7 +139,7 @@ void *worker(void *arg){
 	return NULL;
 }
 
-
+//// MAIN ///////
 int main(int argc, char **argv){
 
 	int nthreads = DEFAULT_NTHREADS;
@@ -141,19 +166,6 @@ int main(int argc, char **argv){
 	struct Worker_Args *wargs = malloc(sizeof(struct Worker_Args));
 	wargs->set = set;
 	wargs->tq = tq;
-
-
-	//validate that the root directory exists
- 	if(stat(path, &st) == 0){
-		if(S_ISDIR(st.st_mode)){
-			rootTask->path = path;
-			set->rootPath = path;
-			set->pattern = pattern;
-		}else{
-			printf("The Directory given does not exist");
-			exit(EXIT_FAILURE);
-		}
-	}
 
 	//validate and get the options
 	while((opt=getopt_long(argc, argv, "t:T:h", longopts, NULL)) != -1){
@@ -205,6 +217,19 @@ int main(int argc, char **argv){
 
 	char *path = argv[optind];
 	char *pattern = argv[optind+1];
+
+	//validate that the root directory exists
+ 	if(stat(path, &st) == 0){
+		if(S_ISDIR(st.st_mode)){
+			rootTask->path = path;
+			set->rootPath = path;
+			set->pattern = pattern;
+		}else{
+			printf("The Directory given does not exist");
+			exit(EXIT_FAILURE);
+		}
+	}
+
 
 	//initialize the mutex and condition var
 	pthread_mutex_init(&set->queue_mtx, NULL);
